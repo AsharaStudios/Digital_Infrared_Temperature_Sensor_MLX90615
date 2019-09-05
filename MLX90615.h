@@ -3,6 +3,8 @@
 
 #include <Arduino.h>
 #include <I2cMaster.h>
+#include <Wire.h>
+#include <stdbool.h>
 
 #define MLX90615_OBJECT_TEMPERATURE     0x27
 #define MLX90615_AMBIENT_TEMPERATURE    0x26
@@ -13,9 +15,55 @@
 
 
 class MLX90615 {
-public:
+
+protected:
+	TwoWire *wbus;
 	I2cMasterBase *bus;
 	byte i2c_addr;
+	uint8_t buffer[6];
+
+	int writeI2C(uint8_t *buff, uint8_t len, bool stop = true) {
+		int sent = 0;
+		if (bus && !wbus) {
+			byte dev = i2c_addr << 1;
+			bus->start(dev | I2C_WRITE);
+			for (uint8_t i = 0 ; i < len ; i++) {
+				if (bus->write(buffer[i]))
+					sent++;
+				else
+					break;
+			}
+			if (stop)
+				bus->stop();
+			else
+				bus->restart(dev | I2C_READ);
+			return sent;
+		} else if (wbus && !bus) {
+			wbus->beginTransmission(i2c_addr);
+			wbus->write(buffer,len);
+			wbus->endTransmission(stop);
+			return sent;
+		} else return -1;
+	}
+
+	int readI2C(uint8_t *buff, uint8_t len){
+		int read = 0;
+		if (bus && !wbus) {
+			for (uint8_t i = 0 ; i < len ; i++ ) {
+				buff[i] = bus->read(i == len-1);
+			}
+			bus->stop();
+			return read;
+		} else if (wbus && !bus) {
+			read = wbus->requestFrom(i2c_addr,len);
+			for (uint8_t i = 0 ; i < read ; i++ ) {
+				buff[i] = wbus->read();
+			}
+			return read;
+		} else return -1;
+	}
+
+public:
 
 	/*******************************************************************
 	 * Function Name: init
@@ -26,6 +74,13 @@ public:
 	MLX90615(byte addr, I2cMasterBase *i2c) {
 		i2c_addr = addr;
 		bus = i2c;
+		wbus = 0;
+	}
+
+	MLX90615(byte addr, TwoWire *i2c) {
+		i2c_addr = addr;
+		bus = 0;
+		wbus = i2c;
 	}
 
 	/****************************************************************
@@ -60,35 +115,16 @@ public:
 	 * Parameters: Temperature_kind - choose ambient or object Temperature
 	 * Return:  true for ok, false for failure
 	****************************************************************/
-	float getTemperature(int Temperature_kind) {
-		byte dev = (i2c_addr << 1);  // remain to be seen!
-		byte dataLow = 0;
-		byte dataHigh = 0;
-		byte pec = 0;
-		float celcius = 0.0;
-
-		bus->start(dev | I2C_WRITE);
-		bus->write(Temperature_kind);
-		// read
-		bus->restart(dev | I2C_READ);
-		dataLow = bus->read(false);
-		dataHigh = bus->read(false);
-		pec = bus->read(true);
-		bus->stop();
-
-		//This converts high and low bytes together and processes temperature, MSB is a error bit and is ignored for temps
-		double tempFactor = 0.02; // 0.02 degrees per LSB (measurement resolution of the MLX90614)
-		double tempData = 0x0000; // zero out the data
-		int frac; // data past the decimal point
-
+	float getTemperature(int Temperature_kind, bool fahrenheit = false) {
+		float celcius;
+		const double tempFactor = 0.02; // 0.02 degrees per LSB (measurement resolution of the MLX90614)
 		// This masks off the error bit of the high byte, then moves it left 8 bits and adds the low byte.
-		tempData = (double)(((dataHigh & 0x007F) << 8) | dataLow);
+		double tempData = readRegS16(Temperature_kind) & 0x7FFF;
 		tempData = (tempData * tempFactor) - 0.01;
 
 		celcius = (float)(tempData - 273.15);
 
-		return celcius;
-		//float fahrenheit = (celcius*1.8) + 32;
+		return fahrenheit ? (celcius*1.8) + 32.0 : celcius;
 	}
 
 	float getTemperatureFahrenheit(float celcius){
@@ -101,24 +137,15 @@ public:
 	 * Return: -1 for failure, 0 for ok
 	****************************************************************/
 	int readEEPROM() {
-		int dev = i2c_addr << 1;
-		int dataLow = 0;
-		int dataHigh = 0;
-		int pec = 0;
-
 		delay(500);
-		bus->start(dev | I2C_WRITE);
-		bus->write(AccessEEPROM);
+		buffer[0] = AccessEEPROM;
+		if (writeI2C(buffer,1,false) < 1)
+			return -1;
 		// read
-		if(!bus->restart(dev | I2C_READ))
-		dataLow = bus->read(false);
-		dataHigh = bus->read(false);
-		pec = bus->read(true);
-		bus->stop();
+		if (readI2C(buffer,3) < 3)
+			return -1;
 
-		uint16_t eepromData = 0x0000; // zero out the data
-
-		eepromData = (uint16_t)(((dataHigh & 0x007F) << 8) + dataLow);
+		uint16_t eepromData = ((((uint16_t)buffer[1] & 0x007F) << 8) + buffer[0]);
 
 		Serial.print("eepromData: 0x");
 		Serial.println(eepromData, HEX);
@@ -126,47 +153,51 @@ public:
 		return 0;
 	}
 
-	/****************************************************************
-	 * Function Name: WriteEEPROM
-	 * Description:  write EEPROM at address 0x13 to adjust emissivity
-	 * Parameters: emissivity – data to write into EEPROM
-	 * Return: 0 - success; -1 - crc8 check err.
-	****************************************************************/
 	int write(uint8_t EEPROM_addr,uint16_t value)
 	{
-		char  buffer[6] = {0};
-	   char *write = buffer + 0;
-	   char *cmd = buffer + 1;
-	   char *data = buffer + 2;
-	   int dev = i2c_addr<<1;
-
-	   *write = dev;
-	   *cmd = EEPROM_addr;
-	   *(data++) = value & 0xff;
-	   *(data++) = (value >> 8) & 0xff;
-	   *data = crc8Msb(0x07, (uint8_t*)buffer, 4);
-
+		buffer[0] = i2c_addr<<1;
+		buffer[1] = EEPROM_addr;
+		buffer[2] = value & 0xff;
+		buffer[3] = (value >> 8) & 0xff;
+		buffer[4] = crc8Msb(0x07, buffer, 4);
 	//    Serial.println(*data, HEX);
 
-	   if(crc8Msb(0x07,(uint8_t*)buffer, 5))
+	   if(crc8Msb(0x07,buffer, 5))
 	   {
 			 Serial.println("CRC8 Check Err...");
 			 return -1;
 	   }
 	   Serial.println("CRC8 Check OK...");
 
-		 if(!bus->start(dev | I2C_WRITE)) return -2;
-		 if(!bus->write(EEPROM_addr)) return -3;
-		 if(!bus->write(value & 0xff)) return -4;
-		 if(!bus->write((value >> 8) & 0xff)) return -5;
-		 if(!bus->write(data[0])) return -6;
-		 bus->stop();
-
-	   return 0;
+		return writeI2C(&buffer[1],4);
 	}
 
+	/****************************************************************
+	 * Function Name: writeEmissivity
+	 * Description:  write EEPROM at address 0x13 to adjust emissivity
+	 * Parameters: emissivity – data to write into EEPROM
+	 * Return: 0 - success; -1 - crc8 check err.
+	****************************************************************/
 	int writeEmissivity(uint16_t emissivity){
 		return write(AccessEEPROM,emissivity);
+	}
+
+	/****************************************************************
+	 * Function Name: read8
+	 * Description:  i2c read register for one byte
+	 * Parameters:
+	 * Return: sucess - true/false
+	****************************************************************/
+	bool read8(byte reg, uint8_t &result)
+	{
+		buffer[0] = reg;
+		if (writeI2C(buffer,1,false) < 1)
+			return false;
+		if (readI2C(buffer,2)< 2)
+			return false;
+		result = buffer[0];
+
+		return true;
 	}
 
 	/****************************************************************
@@ -177,18 +208,26 @@ public:
 	****************************************************************/
 	byte read8(byte reg)
 	{
-		byte data;
-		byte dev = i2c_addr << 1;
+		byte result;
+		read8(reg,result);
+		return result;
+	}
 
-		bus->start(dev | I2C_WRITE);
-		bus->write(reg);
-		// read
-		bus->restart(i2c_addr | I2C_READ);
-		data = bus->read(false);
-		bus->read(true);
-		bus->stop();
-
-		return data;
+	/****************************************************************
+	 * Function Name: readRegS16
+	 * Description:  i2c read register for int data
+	 * Parameters:
+	 * Return: sucess - true/false
+	****************************************************************/
+	bool readRegS16(byte reg, uint16_t &result)
+	{
+		buffer[0] = reg;
+		if (writeI2C(buffer,1,false) < 1)
+			return false;
+		if (readI2C(buffer,3)< 3)
+			return false;
+		result = ((uint16_t)buffer[1] << 8) | buffer[0];
+		return true;
 	}
 
 	/****************************************************************
@@ -199,52 +238,36 @@ public:
 	****************************************************************/
 	int readRegS16(byte reg)
 	{
-		uint8_t dataLow, dataHigh;
-		byte dev = i2c_addr << 1;
-
-		bus->start(dev | I2C_WRITE);
-		bus->write(reg);
-		// read
-		bus->restart(i2c_addr | I2C_READ);
-		dataLow = bus->read(false);
-		dataHigh = bus->read(false);
-		bus->read(true);
-		bus->stop();
-
-		return (int)(dataHigh << 8) || dataLow;
+		uint16_t result;
+		readRegS16(reg,result);
+		return (int)result;
 	}
 
 	/****************************************************************
 	 * Function Name: writeReg8
 	 * Description:  i2c write register one byte
 	 * Parameters:
-	 * Return:
+	 * Return: success: true/false
 	****************************************************************/
-	void writeReg8(byte data, byte reg)
+	bool writeReg8(byte data, byte reg)
 	{
-		byte dev = i2c_addr << 1;
-
-		bus->start(dev | I2C_WRITE);
-		bus->write(reg);
-		bus->write(data);
-		bus->stop();
+		buffer[0] = reg;
+		buffer[1] = data;
+		return writeI2C(buffer,2);
 	}
 
 	/****************************************************************
 	 * Function Name: writeReg16
 	 * Description:  i2c write register int data
 	 * Parameters:
-	 * Return:
+	 * Return: bytes sent
 	****************************************************************/
-	void writeReg16(uint16_t data, byte reg)
+	int writeReg16(uint16_t data, byte reg)
 	{
-		byte dev = i2c_addr << 1;
-
-		bus->start(dev | I2C_WRITE);
-		bus->write(reg);
-		bus->write((data >> 8) & 0xFF);
-		bus->write(data & 0xFF);
-		bus->stop();
+		buffer[0] = reg;
+		buffer[1] = (data >> 8) & 0xFF;
+		buffer[2] = data & 0xFF;
+		return writeI2C(buffer,3);
 	}
 };
 #endif // __MLX90615_H__

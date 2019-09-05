@@ -12,6 +12,7 @@ env:
     - PLATFORMIO_CI_SRC=examples/singleDevice
     - PLATFORMIO_CI_SRC=examples/multiDevice
     - PLATFORMIO_CI_SRC=examples/changeAddr
+    - PLATFORMIO_CI_SRC=examples/usingWire
 
 install:
     - pip install -U platformio
